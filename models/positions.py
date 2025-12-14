@@ -77,6 +77,25 @@ class AssetQuality(str, Enum):
     LOSS = "loss"
 
 
+class CouponFrequency(str, Enum):
+    """Частота купонных выплат (для облигаций)"""
+    ANNUAL = "annual"
+    SEMIANNUAL = "semiannual"
+    QUARTERLY = "quarterly"
+    MONTHLY = "monthly"
+    ZERO = "zero"  # Для бескупонных облигаций
+
+
+class BondType(str, Enum):
+    """Типы облигаций"""
+    GOVERNMENT = "government"  # ОФЗ, treasuries
+    CORPORATE = "corporate"    # Корпоративные облигации
+    MUNICIPAL = "municipal"    # Муниципальные
+    SUPRANATIONAL = "supranational"  # Наднациональные (ЕБРР, ВБ и т.д.)
+    STRUCTURED = "structured"  # Структурные продукты
+    OTHER = "other"
+
+
 # ============================================================================
 # Базовый класс Position
 # ============================================================================
@@ -571,6 +590,311 @@ class RetailDeposit(DepositBase):
 
 
 # ============================================================================
+# Облигации
+# ============================================================================
+
+class Bond(BalanceSheetInstrument):
+    """
+    Облигации (bonds).
+
+    Облигации = активы банка (инвестиционный портфель).
+    Используются для управления ликвидностью и процентным риском.
+
+    Ключевые особенности:
+    - Купонные выплаты с определенной периодичностью
+    - Погашение номинала в maturity_date
+    - Могут быть бескупонными (zero-coupon)
+    - Рыночная переоценка (mark-to-market)
+    - Классификация: HTM, AFS, HFT (для целей учета)
+    """
+
+    instrument_type: Literal[InstrumentType.BOND] = InstrumentType.BOND
+
+    # Основные параметры облигации
+    bond_type: BondType = Field(..., description="Тип облигации (government, corporate и т.д.)")
+    isin: Optional[str] = Field(None, description="ISIN код облигации")
+    issuer: str = Field(..., description="Эмитент облигации")
+
+    # Номинал и цена покупки
+    face_value: Decimal = Field(..., description="Номинал облигации")
+    purchase_price: Optional[Decimal] = Field(None, description="Цена покупки (% от номинала)")
+    current_market_price: Optional[Decimal] = Field(None, description="Текущая рыночная цена (% от номинала)")
+
+    # Купонные выплаты
+    coupon_rate: Decimal = Field(..., description="Годовая купонная ставка (в долях: 0.08 = 8%)")
+    coupon_frequency: CouponFrequency = Field(..., description="Частота купонных выплат")
+    next_coupon_date: Optional[date] = Field(None, description="Дата следующего купона")
+    accrued_interest: Optional[Decimal] = Field(None, description="НКД (накопленный купонный доход)")
+
+    # Классификация для учета
+    accounting_classification: Optional[str] = Field(
+        None,
+        description="Классификация для учета: HTM (held-to-maturity), AFS (available-for-sale), HFT (held-for-trading)"
+    )
+
+    # Для оценки кредитного риска
+    credit_rating: Optional[str] = Field(None, description="Кредитный рейтинг (Moody's, S&P, Fitch)")
+    is_investment_grade: bool = Field(default=True, description="Инвестиционный рейтинг")
+
+    # Callable/Puttable опции
+    is_callable: bool = Field(default=False, description="Может быть отозвана эмитентом")
+    call_date: Optional[date] = Field(None, description="Дата, с которой может быть отозвана")
+    call_price: Optional[Decimal] = Field(None, description="Цена отзыва (% от номинала)")
+
+    is_puttable: bool = Field(default=False, description="Может быть предъявлена к досрочному погашению")
+    put_date: Optional[date] = Field(None, description="Дата, с которой может быть предъявлена")
+    put_price: Optional[Decimal] = Field(None, description="Цена предъявления (% от номинала)")
+
+    @model_validator(mode='after')
+    def validate_bond_logic(self):
+        """Валидация специфичной логики облигаций"""
+        # Для callable облигаций должна быть указана call_date
+        if self.is_callable and not self.call_date:
+            raise ValueError('Callable bond requires call_date')
+
+        # Для puttable облигаций должна быть указана put_date
+        if self.is_puttable and not self.put_date:
+            raise ValueError('Puttable bond requires put_date')
+
+        # Купонная ставка не может быть отрицательной
+        if self.coupon_rate < 0:
+            raise ValueError('Coupon rate cannot be negative')
+
+        # Для бескупонных облигаций ставка должна быть 0
+        if self.coupon_frequency == CouponFrequency.ZERO and self.coupon_rate != 0:
+            raise ValueError('Zero-coupon bond must have coupon_rate = 0')
+
+        # Номинал должен совпадать с amount (или быть пропорциональным)
+        # amount = номинал * количество облигаций
+        if self.amount <= 0:
+            raise ValueError('Bond amount must be positive')
+
+        return self
+
+    @field_validator('accounting_classification')
+    @classmethod
+    def validate_accounting_classification(cls, v):
+        """Валидация классификации для учета"""
+        if v is None:
+            return v
+        allowed = {'HTM', 'AFS', 'HFT', 'htm', 'afs', 'hft'}
+        if v.upper() not in allowed:
+            raise ValueError(f'accounting_classification must be one of HTM, AFS, HFT')
+        return v.upper()
+
+    def get_effective_maturity(self) -> Optional[date]:
+        """
+        Для облигаций эффективная дата = contractual maturity.
+
+        Если облигация callable и банк ожидает отзыва, эффективная дата = call_date.
+        Если puttable и банк планирует предъявить, эффективная дата = put_date.
+
+        Для простоты пока возвращаем maturity_date.
+        Behavioral assumptions могут скорректировать через AssumptionEngine.
+        """
+        return self.maturity_date
+
+    def get_coupon_payment_amount(self) -> Decimal:
+        """
+        Рассчитывает сумму одной купонной выплаты.
+
+        Returns:
+            Decimal: Сумма купона за период
+        """
+        if self.coupon_frequency == CouponFrequency.ZERO:
+            return Decimal(0)
+
+        # Частота купонов в год
+        freq_map = {
+            CouponFrequency.ANNUAL: 1,
+            CouponFrequency.SEMIANNUAL: 2,
+            CouponFrequency.QUARTERLY: 4,
+            CouponFrequency.MONTHLY: 12,
+        }
+
+        frequency = freq_map.get(self.coupon_frequency, 1)
+
+        # Купон за период = (номинал * годовая ставка) / частота
+        coupon = (self.face_value * self.coupon_rate) / Decimal(frequency)
+
+        return coupon
+
+    def get_number_of_bonds(self) -> Decimal:
+        """
+        Рассчитывает количество облигаций в позиции.
+
+        Returns:
+            Decimal: Количество облигаций (amount / face_value)
+        """
+        if self.face_value == 0:
+            return Decimal(0)
+        return self.amount / self.face_value
+
+    def get_cash_flows(self, scenario: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Генерирует денежные потоки по облигации.
+
+        Включает:
+        - Купонные выплаты (если не zero-coupon)
+        - Погашение номинала в maturity_date
+
+        Args:
+            scenario: Опциональные сценарные параметры
+
+        Returns:
+            List[Dict]: Денежные потоки
+        """
+        if not self.maturity_date:
+            logger.warning(f"Bond {self.position_id} has no maturity_date, cannot generate cash flows")
+            return []
+
+        cash_flows = []
+
+        # Количество облигаций
+        num_bonds = self.get_number_of_bonds()
+
+        # Если zero-coupon, только погашение номинала
+        if self.coupon_frequency == CouponFrequency.ZERO:
+            cash_flows.append({
+                'date': self.maturity_date,
+                'principal': self.amount,  # Погашение номинала
+                'interest': Decimal(0),
+                'total': self.amount,
+                'type': 'maturity'
+            })
+            return cash_flows
+
+        # Генерируем купонные выплаты
+        coupon_amount = self.get_coupon_payment_amount()
+
+        # Частота купонов
+        freq_map = {
+            CouponFrequency.ANNUAL: 12,
+            CouponFrequency.SEMIANNUAL: 6,
+            CouponFrequency.QUARTERLY: 3,
+            CouponFrequency.MONTHLY: 1,
+        }
+        months_between_coupons = freq_map.get(self.coupon_frequency, 12)
+
+        # Начинаем с next_coupon_date или рассчитываем от as_of_date
+        current_coupon_date = self.next_coupon_date if self.next_coupon_date else self.as_of_date
+
+        # Генерируем купоны до maturity
+        while current_coupon_date <= self.maturity_date:
+            if current_coupon_date >= self.as_of_date:
+                # Купон за все облигации в позиции
+                total_coupon = coupon_amount * num_bonds
+
+                cash_flows.append({
+                    'date': current_coupon_date,
+                    'principal': Decimal(0),
+                    'interest': total_coupon,
+                    'total': total_coupon,
+                    'type': 'coupon'
+                })
+
+            # Следующий купон
+            # Упрощенная логика: добавляем месяцы
+            from datetime import timedelta
+            if months_between_coupons == 1:
+                # Ежемесячный купон
+                year = current_coupon_date.year
+                month = current_coupon_date.month + 1
+                if month > 12:
+                    month = 1
+                    year += 1
+                try:
+                    current_coupon_date = date(year, month, current_coupon_date.day)
+                except ValueError:
+                    # Если день не существует (например, 31 февраля), берем последний день месяца
+                    import calendar
+                    last_day = calendar.monthrange(year, month)[1]
+                    current_coupon_date = date(year, month, last_day)
+            else:
+                # Для квартальных, полугодовых, годовых
+                year = current_coupon_date.year
+                month = current_coupon_date.month + months_between_coupons
+                while month > 12:
+                    month -= 12
+                    year += 1
+                try:
+                    current_coupon_date = date(year, month, current_coupon_date.day)
+                except ValueError:
+                    import calendar
+                    last_day = calendar.monthrange(year, month)[1]
+                    current_coupon_date = date(year, month, last_day)
+
+        # Погашение номинала в maturity_date
+        cash_flows.append({
+            'date': self.maturity_date,
+            'principal': self.amount,  # Погашение номинала
+            'interest': Decimal(0),
+            'total': self.amount,
+            'type': 'maturity'
+        })
+
+        # Сортируем по датам
+        cash_flows.sort(key=lambda x: x['date'])
+
+        return cash_flows
+
+    def get_yield_to_maturity(self) -> Optional[Decimal]:
+        """
+        Рассчитывает доходность к погашению (YTM).
+
+        Для упрощения возвращаем приблизительную YTM.
+        Полный расчет требует численных методов (Newton-Raphson).
+
+        Returns:
+            Optional[Decimal]: YTM (годовых, в долях)
+        """
+        if not self.maturity_date or not self.current_market_price:
+            return None
+
+        # Упрощенная формула для приблизительной YTM
+        # YTM ≈ [Annual Coupon + (Face Value - Price) / Years] / [(Face Value + Price) / 2]
+
+        time_to_maturity = self.get_time_to_maturity_years()
+        if not time_to_maturity or time_to_maturity <= 0:
+            return None
+
+        annual_coupon = self.face_value * self.coupon_rate
+        price = (self.face_value * self.current_market_price) / Decimal(100)
+
+        numerator = annual_coupon + (self.face_value - price) / time_to_maturity
+        denominator = (self.face_value + price) / Decimal(2)
+
+        if denominator == 0:
+            return None
+
+        ytm = numerator / denominator
+
+        return ytm
+
+    def get_accrued_interest_amount(self, calculation_date: Optional[date] = None) -> Decimal:
+        """
+        Рассчитывает накопленный купонный доход (НКД).
+
+        Args:
+            calculation_date: Дата расчета НКД (по умолчанию as_of_date)
+
+        Returns:
+            Decimal: Сумма НКД
+        """
+        if self.coupon_frequency == CouponFrequency.ZERO:
+            return Decimal(0)
+
+        if self.accrued_interest is not None:
+            return self.accrued_interest
+
+        # Упрощенный расчет НКД (требует знания дат последнего и следующего купонов)
+        # Для полного расчета нужен более сложный алгоритм с учетом конвенций (ACT/360, ACT/365 и т.д.)
+
+        # Пока возвращаем 0, если НКД не указан явно
+        return Decimal(0)
+
+
+# ============================================================================
 # Вспомогательные функции
 # ============================================================================
 
@@ -600,6 +924,7 @@ def create_position_from_dict(data: Dict[str, Any]) -> Position:
         InstrumentType.LOAN_RETAIL: RetailLoan,
         InstrumentType.DEPOSIT_CORPORATE: CorporateDeposit,
         InstrumentType.DEPOSIT_RETAIL: RetailDeposit,
+        InstrumentType.BOND: Bond,
     }
 
     # Если передана строка, конвертируем в enum

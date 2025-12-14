@@ -12,6 +12,8 @@ from models.positions import (
     RateType,
     RepricingFrequency,
     AssetQuality,
+    CouponFrequency,
+    BondType,
 
     # Base classes
     Position,
@@ -27,6 +29,9 @@ from models.positions import (
     CorporateDeposit,
     RetailDeposit,
 
+    # Bond classes
+    Bond,
+
     # Helper functions
     create_position_from_dict,
     positions_to_dataframe,
@@ -41,6 +46,8 @@ __all__ = [
     'RateType',
     'RepricingFrequency',
     'AssetQuality',
+    'CouponFrequency',
+    'BondType',
 
     # Base classes
     'Position',
@@ -55,6 +62,9 @@ __all__ = [
     'DepositBase',
     'CorporateDeposit',
     'RetailDeposit',
+
+    # Bond classes
+    'Bond',
 
     # Helper functions
     'create_position_from_dict',
