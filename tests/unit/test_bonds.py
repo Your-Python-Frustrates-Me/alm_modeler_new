@@ -1,3 +1,4 @@
+from decimal import Decimal
 """
 Unit тесты для класса Bond.
 
@@ -11,7 +12,7 @@ Unit тесты для класса Bond.
 
 import pytest
 from datetime import date, timedelta
-from decimal import Decimal
+
 
 from models.positions import (
     Bond,

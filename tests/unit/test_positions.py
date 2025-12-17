@@ -1,3 +1,4 @@
+from decimal import Decimal
 """
 Unit тесты для классов балансовых инструментов.
 
@@ -10,7 +11,7 @@ Unit тесты для классов балансовых инструмент�
 
 import pytest
 from datetime import date, timedelta
-from decimal import Decimal
+
 import pandas as pd
 
 from models.positions import (
