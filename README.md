@@ -341,7 +341,3 @@ nmd_deposit.get_cash_flows()
 4. **Data Connectors** - загрузка из КХД/Excel/API
 5. **Config Loader** - загрузка конфигураций
 6. **Versioning Framework** - версионирование расчетов
-
-## 📄 Лицензия
-
-Internal use only - Commercial Bank ALM System
